@@ -8,3 +8,5 @@ tqdm
 Pillow
 scikit-learn
 trimesh
+scipy
+pyrender
