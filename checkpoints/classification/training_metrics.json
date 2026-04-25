@@ -1,0 +1,26 @@
+{
+  "best_val_acc": 0.784140625,
+  "epochs": 1,
+  "batch_size": 16,
+  "learning_rate": 0.001,
+  "train_samples": 51200,
+  "val_samples": 12800,
+  "checkpoint": "outputs/classification_debug/best_model.pt",
+  "class_names": [
+    "Simple Box / Compact Bus",
+    "Box Bus + Solar Wings",
+    "Complex Multi-Wing / Multi-Arm",
+    "Cylindrical / Drum-Shaped",
+    "Instrument-Dominant",
+    "Probes & Irregular Craft"
+  ],
+  "history": [
+    {
+      "epoch": 1.0,
+      "train_loss": 0.899363408156205,
+      "train_acc": 0.65658203125,
+      "val_loss": 0.5644600271550008,
+      "val_acc": 0.784140625
+    }
+  ]
+}
