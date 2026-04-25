@@ -8,6 +8,11 @@ from typing import Iterable, Mapping
 
 import numpy as np
 
+try:
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None
+
 
 def ensure_dir(path: str | Path) -> Path:
     directory = Path(path)
@@ -40,4 +45,7 @@ def write_csv(path: str | Path, fieldnames: list[str], rows: Iterable[Mapping[st
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
-
+    if torch is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
