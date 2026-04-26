@@ -64,6 +64,11 @@ def quaternion_multiply(quaternion_a: np.ndarray, quaternion_b: np.ndarray) -> n
     )
 
 
+def quaternion_inverse(quaternion_xyzw: np.ndarray) -> np.ndarray:
+    x, y, z, w = normalize_quaternion(quaternion_xyzw)
+    return np.asarray([-x, -y, -z, w], dtype=np.float64)
+
+
 def axis_angle_to_quaternion(axis: np.ndarray, angle_radians: float) -> np.ndarray:
     axis = np.asarray(axis, dtype=np.float64)
     norm = np.linalg.norm(axis)
@@ -107,3 +112,80 @@ def camera_position_in_body_frame(quaternion_xyzw: np.ndarray, translation: np.n
     translation = np.asarray(translation, dtype=np.float64)
     return -(rotation_matrix.T @ translation)
 
+
+def camera_positions_in_body_frame(quaternions_xyzw, translations) -> np.ndarray:
+    positions = [
+        camera_position_in_body_frame(quaternion_xyzw, translation)
+        for quaternion_xyzw, translation in zip(quaternions_xyzw, translations)
+    ]
+    return np.asarray(positions, dtype=np.float64)
+
+
+def cartesian_to_spherical(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    vectors = np.asarray(vectors, dtype=np.float64)
+    radius = np.linalg.norm(vectors, axis=1)
+    safe_radius = np.where(radius == 0, 1.0, radius)
+    azimuth = np.degrees(np.arctan2(vectors[:, 1], vectors[:, 0]))
+    elevation = np.degrees(np.arcsin(np.clip(vectors[:, 2] / safe_radius, -1.0, 1.0)))
+    return azimuth, elevation, radius
+
+
+def spherical_to_cartesian(azimuth_deg: float, elevation_deg: float, radius: float) -> np.ndarray:
+    azimuth = math.radians(azimuth_deg)
+    elevation = math.radians(elevation_deg)
+    cos_elevation = math.cos(elevation)
+    return np.asarray(
+        [
+            radius * cos_elevation * math.cos(azimuth),
+            radius * cos_elevation * math.sin(azimuth),
+            radius * math.sin(elevation),
+        ],
+        dtype=np.float64,
+    )
+
+
+def rotate_about_axis(vector: np.ndarray, axis: np.ndarray, angle_radians: float) -> np.ndarray:
+    vector = np.asarray(vector, dtype=np.float64)
+    axis = np.asarray(axis, dtype=np.float64)
+    axis_norm = np.linalg.norm(axis)
+    if axis_norm == 0:
+        return vector
+    axis = axis / axis_norm
+    cos_angle = math.cos(angle_radians)
+    sin_angle = math.sin(angle_radians)
+    return (
+        vector * cos_angle
+        + np.cross(axis, vector) * sin_angle
+        + axis * np.dot(axis, vector) * (1.0 - cos_angle)
+    )
+
+
+def pose_from_camera_position(
+    camera_position_body: np.ndarray,
+    *,
+    roll_deg: float = 0.0,
+    up_hint: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    camera_position_body = np.asarray(camera_position_body, dtype=np.float64)
+    distance = np.linalg.norm(camera_position_body)
+    if distance == 0:
+        raise ValueError("Camera position cannot be the zero vector.")
+
+    z_axis_body = -camera_position_body / distance
+    reference_up = np.asarray(up_hint if up_hint is not None else [0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(float(np.dot(reference_up, z_axis_body))) > 0.95:
+        reference_up = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+
+    x_axis_body = np.cross(reference_up, z_axis_body)
+    x_axis_body /= np.linalg.norm(x_axis_body)
+    y_axis_body = np.cross(z_axis_body, x_axis_body)
+    y_axis_body /= np.linalg.norm(y_axis_body)
+
+    if roll_deg != 0.0:
+        roll_radians = math.radians(roll_deg)
+        x_axis_body = rotate_about_axis(x_axis_body, z_axis_body, roll_radians)
+        y_axis_body = rotate_about_axis(y_axis_body, z_axis_body, roll_radians)
+
+    rotation = np.stack([x_axis_body, y_axis_body, z_axis_body], axis=0)
+    translation = -(rotation @ camera_position_body)
+    return matrix_to_quaternion(rotation), translation.astype(np.float64)
