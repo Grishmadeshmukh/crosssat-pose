@@ -193,7 +193,7 @@ benchmark refiner workflow produces:
 - `qualitative_gallery.png`
 
 # Classification
-Training
+Training (below is the best run so far)
 ```bash
 python3 scripts/run_classification_train.py \
   --dataset-root spe3r \
