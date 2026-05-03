@@ -52,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-radius-samples", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--debug-log-first-n-samples", type=int, default=2)
+    parser.add_argument("--debug-log-first-n-batches", type=int, default=2)
+    parser.add_argument("--debug-render-smoke-test", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--output-dir", default=default_output_root("benchmark_refiner"))
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -103,6 +106,9 @@ def main() -> None:
         device=device,
         output_dir=args.output_dir,
         seed=args.seed,
+        debug_log_first_n_samples=args.debug_log_first_n_samples,
+        debug_log_first_n_batches=args.debug_log_first_n_batches,
+        debug_render_smoke_test=args.debug_render_smoke_test,
     )
 
 

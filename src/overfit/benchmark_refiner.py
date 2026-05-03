@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from scipy.spatial import cKDTree
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 
 from common import ensure_dir, write_csv, write_json, write_text
 from data_utils import PoseRecord, SPE3RSatellite, load_camera_config, subsample_records
@@ -346,6 +346,10 @@ def build_coarse_candidate_bank(
     return candidates
 
 
+def _log(message: str) -> None:
+    print(f"[benchmark_refiner] {message}", flush=True)
+
+
 class ShortlistRefinerDataset(Dataset[dict[str, object]]):
     def __init__(
         self,
@@ -365,6 +369,9 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
         mesh_symmetry_group_quaternions_xyzw: Sequence[np.ndarray] | None = None,
         samples_per_epoch: int = 2048,
         seed: int = 42,
+        enable_debug_logging: bool = False,
+        debug_log_first_n_samples: int = 0,
+        debug_name: str = "dataset",
     ):
         self.query_satellite = query_satellite
         self.query_records = list(query_records)
@@ -384,11 +391,28 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
         ]
         self.samples_per_epoch = samples_per_epoch
         self.seed = seed
+        self.enable_debug_logging = enable_debug_logging
+        self.debug_log_first_n_samples = debug_log_first_n_samples
+        self.debug_name = debug_name
         self._renderer: MeshRenderer | None = None
+        self._debug_logged_samples = 0
+
+    def _dataset_log(self, message: str) -> None:
+        if not self.enable_debug_logging:
+            return
+        worker = get_worker_info()
+        worker_suffix = f" worker={worker.id}" if worker is not None else " worker=main"
+        print(f"[benchmark_refiner:{self.debug_name}{worker_suffix}] {message}", flush=True)
 
     def _get_renderer(self) -> MeshRenderer:
         if self._renderer is None:
+            self._dataset_log(
+                "creating renderer "
+                f"mesh={self.mesh_satellite.model_path} viewport="
+                f"{self.camera_config['Nu']}x{self.camera_config['Nv']}"
+            )
             self._renderer = MeshRenderer(self.mesh_satellite.model_path, self.camera_config)
+            self._dataset_log("renderer created successfully")
         return self._renderer
 
     def __len__(self) -> int:
@@ -415,92 +439,122 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
         ]
 
     def __getitem__(self, index: int) -> dict[str, object]:
-        rng = np.random.default_rng(self.seed + index)
-        query_record = self.query_records[int(rng.integers(0, len(self.query_records)))]
-        query_image = self.query_satellite.load_image(query_record)
-        query_mask_image = self.query_satellite.load_mask(query_record)
-        query_mask = np.asarray(query_mask_image, dtype=np.uint8) > 127
-        query_rgb = np.asarray(query_image, dtype=np.float32) / 255.0
-        renderer = self._get_renderer()
+        should_log_sample = self.enable_debug_logging and self._debug_logged_samples < self.debug_log_first_n_samples
+        try:
+            rng = np.random.default_rng(self.seed + index)
+            query_record = self.query_records[int(rng.integers(0, len(self.query_records)))]
+            if should_log_sample:
+                self._dataset_log(f"getitem start index={index} query={query_record.filename}")
+            query_image = self.query_satellite.load_image(query_record)
+            query_mask_image = self.query_satellite.load_mask(query_record)
+            query_mask = np.asarray(query_mask_image, dtype=np.uint8) > 127
+            query_rgb = np.asarray(query_image, dtype=np.float32) / 255.0
+            if should_log_sample:
+                self._dataset_log(
+                    "loaded query image "
+                    f"shape={query_rgb.shape} mask_pixels={int(query_mask.sum())}"
+                )
+            renderer = self._get_renderer()
 
-        shortlist = self._sample_shortlist(query_image, query_mask_image)
-        pair_tensors = []
-        seed_quaternions = []
-        seed_translations = []
-        rotation_errors = []
-        symmetry_rotation_errors = []
-        delta_quaternions = []
+            if should_log_sample:
+                self._dataset_log("building shortlist from geometry")
+            shortlist = self._sample_shortlist(query_image, query_mask_image)
+            if should_log_sample:
+                self._dataset_log(f"shortlist ready size={len(shortlist)}")
+            pair_tensors = []
+            seed_quaternions = []
+            seed_translations = []
+            rotation_errors = []
+            symmetry_rotation_errors = []
+            delta_quaternions = []
 
-        for candidate in shortlist:
-            render_rgb_u8, render_mask = renderer.render(candidate.quaternion_xyzw, candidate.translation)
-            pair_tensors.append(
-                build_cropped_pair_tensor(
-                    query_rgb,
-                    query_mask,
-                    render_rgb_u8,
-                    render_mask,
-                    image_size=self.image_size,
-                    crop_padding=self.crop_padding,
+            for candidate_index, candidate in enumerate(shortlist):
+                if should_log_sample and candidate_index == 0:
+                    self._dataset_log(
+                        "rendering first shortlist candidate "
+                        f"source={candidate.filename}"
+                    )
+                render_rgb_u8, render_mask = renderer.render(candidate.quaternion_xyzw, candidate.translation)
+                pair_tensors.append(
+                    build_cropped_pair_tensor(
+                        query_rgb,
+                        query_mask,
+                        render_rgb_u8,
+                        render_mask,
+                        image_size=self.image_size,
+                        crop_padding=self.crop_padding,
+                    )
+                )
+                seed_quaternions.append(np.asarray(candidate.quaternion_xyzw, dtype=np.float32))
+                seed_translations.append(np.asarray(candidate.translation, dtype=np.float32))
+                rotation_errors.append(rotation_error_degrees(candidate.quaternion_xyzw, query_record.quaternion_xyzw))
+                symmetry_error = symmetry_group_rotation_error_degrees(
+                    candidate.quaternion_xyzw,
+                    query_record.quaternion_xyzw,
+                    self.mesh_symmetry_group_quaternions_xyzw,
+                )
+                symmetry_rotation_errors.append(symmetry_error)
+                if self.mesh_symmetry_group_quaternions_xyzw:
+                    equivalent_targets = [
+                        quaternion_multiply(query_record.quaternion_xyzw, symmetry_quaternion)
+                        for symmetry_quaternion in self.mesh_symmetry_group_quaternions_xyzw
+                    ]
+                    best_target = min(
+                        equivalent_targets,
+                        key=lambda equivalent: rotation_error_degrees(candidate.quaternion_xyzw, equivalent),
+                    )
+                else:
+                    best_target = query_record.quaternion_xyzw
+                delta_quaternions.append(relative_delta_quaternion(candidate.quaternion_xyzw, best_target))
+
+            rotation_errors_np = np.asarray(rotation_errors, dtype=np.float32)
+            symmetry_rotation_errors_np = np.asarray(symmetry_rotation_errors, dtype=np.float32)
+            folded_rotation_errors_np = np.asarray(
+                [fold_halfturn_rotation_error_degrees(error) for error in rotation_errors_np],
+                dtype=np.float32,
+            )
+            supervision_rotation_errors = (
+                symmetry_rotation_errors_np if self.mesh_symmetry_group_quaternions_xyzw else (
+                    folded_rotation_errors_np if self.fold_halfturn_symmetry_targets else rotation_errors_np
                 )
             )
-            seed_quaternions.append(np.asarray(candidate.quaternion_xyzw, dtype=np.float32))
-            seed_translations.append(np.asarray(candidate.translation, dtype=np.float32))
-            rotation_errors.append(rotation_error_degrees(candidate.quaternion_xyzw, query_record.quaternion_xyzw))
-            symmetry_error = symmetry_group_rotation_error_degrees(
-                candidate.quaternion_xyzw,
-                query_record.quaternion_xyzw,
-                self.mesh_symmetry_group_quaternions_xyzw,
-            )
-            symmetry_rotation_errors.append(symmetry_error)
-            if self.mesh_symmetry_group_quaternions_xyzw:
-                equivalent_targets = [
-                    quaternion_multiply(query_record.quaternion_xyzw, symmetry_quaternion)
-                    for symmetry_quaternion in self.mesh_symmetry_group_quaternions_xyzw
-                ]
-                best_target = min(
-                    equivalent_targets,
-                    key=lambda equivalent: rotation_error_degrees(candidate.quaternion_xyzw, equivalent),
+            soft_targets = shortlist_soft_targets(
+                supervision_rotation_errors,
+                temperature_deg=self.score_temperature_deg,
+            ).astype(np.float32)
+            refine_order = np.argsort(supervision_rotation_errors)
+            refine_weights = np.zeros_like(rotation_errors_np, dtype=np.float32)
+            refine_weights[refine_order[: min(self.refine_top_m, len(refine_order))]] = 1.0
+            refine_weights_sum = float(refine_weights.sum())
+            if refine_weights_sum > 0:
+                refine_weights /= refine_weights_sum
+
+            output = {
+                "pairs": torch.stack(pair_tensors, dim=0),
+                "seed_quaternions": torch.from_numpy(np.stack(seed_quaternions, axis=0)),
+                "seed_translations": torch.from_numpy(np.stack(seed_translations, axis=0)),
+                "target_quaternion": torch.from_numpy(np.asarray(query_record.quaternion_xyzw, dtype=np.float32)),
+                "target_translation": torch.from_numpy(np.asarray(query_record.translation, dtype=np.float32)),
+                "target_delta_quaternions": torch.from_numpy(np.stack(delta_quaternions, axis=0)),
+                "score_targets": torch.from_numpy(soft_targets),
+                "refine_weights": torch.from_numpy(refine_weights),
+                "candidate_rotation_errors_deg": torch.from_numpy(rotation_errors_np),
+                "candidate_folded_rotation_errors_deg": torch.from_numpy(folded_rotation_errors_np),
+                "candidate_mesh_symmetry_rotation_errors_deg": torch.from_numpy(symmetry_rotation_errors_np),
+                "filename": query_record.filename,
+            }
+            if should_log_sample:
+                self._dataset_log(
+                    "getitem success "
+                    f"index={index} pairs_shape={tuple(output['pairs'].shape)} "
+                    f"rot_min={float(rotation_errors_np.min()):.2f} "
+                    f"rot_max={float(rotation_errors_np.max()):.2f}"
                 )
-            else:
-                best_target = query_record.quaternion_xyzw
-            delta_quaternions.append(relative_delta_quaternion(candidate.quaternion_xyzw, best_target))
-
-        rotation_errors_np = np.asarray(rotation_errors, dtype=np.float32)
-        symmetry_rotation_errors_np = np.asarray(symmetry_rotation_errors, dtype=np.float32)
-        folded_rotation_errors_np = np.asarray(
-            [fold_halfturn_rotation_error_degrees(error) for error in rotation_errors_np],
-            dtype=np.float32,
-        )
-        supervision_rotation_errors = (
-            symmetry_rotation_errors_np if self.mesh_symmetry_group_quaternions_xyzw else (
-                folded_rotation_errors_np if self.fold_halfturn_symmetry_targets else rotation_errors_np
-            )
-        )
-        soft_targets = shortlist_soft_targets(
-            supervision_rotation_errors,
-            temperature_deg=self.score_temperature_deg,
-        ).astype(np.float32)
-        refine_order = np.argsort(supervision_rotation_errors)
-        refine_weights = np.zeros_like(rotation_errors_np, dtype=np.float32)
-        refine_weights[refine_order[: min(self.refine_top_m, len(refine_order))]] = 1.0
-        refine_weights_sum = float(refine_weights.sum())
-        if refine_weights_sum > 0:
-            refine_weights /= refine_weights_sum
-
-        return {
-            "pairs": torch.stack(pair_tensors, dim=0),
-            "seed_quaternions": torch.from_numpy(np.stack(seed_quaternions, axis=0)),
-            "seed_translations": torch.from_numpy(np.stack(seed_translations, axis=0)),
-            "target_quaternion": torch.from_numpy(np.asarray(query_record.quaternion_xyzw, dtype=np.float32)),
-            "target_translation": torch.from_numpy(np.asarray(query_record.translation, dtype=np.float32)),
-            "target_delta_quaternions": torch.from_numpy(np.stack(delta_quaternions, axis=0)),
-            "score_targets": torch.from_numpy(soft_targets),
-            "refine_weights": torch.from_numpy(refine_weights),
-            "candidate_rotation_errors_deg": torch.from_numpy(rotation_errors_np),
-            "candidate_folded_rotation_errors_deg": torch.from_numpy(folded_rotation_errors_np),
-            "candidate_mesh_symmetry_rotation_errors_deg": torch.from_numpy(symmetry_rotation_errors_np),
-            "filename": query_record.filename,
-        }
+                self._debug_logged_samples += 1
+            return output
+        except Exception as exc:
+            self._dataset_log(f"getitem failure index={index} error={type(exc).__name__}: {exc}")
+            raise
 
     def __del__(self) -> None:  # pragma: no cover
         if self._renderer is not None:
@@ -574,6 +628,8 @@ def _run_epoch(
     refine_weight: float,
     fold_halfturn_symmetry_loss: bool,
     mesh_symmetry_group_tensor: torch.Tensor | None,
+    epoch_name: str,
+    debug_log_first_n_batches: int,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
@@ -589,9 +645,19 @@ def _run_epoch(
     }
     total_count = 0
 
-    for batch in loader:
+    for batch_index, batch in enumerate(loader):
+        if batch_index < debug_log_first_n_batches:
+            _log(
+                f"{epoch_name} batch_start index={batch_index} "
+                f"pairs_shape={tuple(batch['pairs'].shape)}"
+            )
         batch_size, shortlist_size = batch["pairs"].shape[:2]
         flat_pairs, seed_quaternions, seed_translations = flatten_shortlist_batch(batch, device)
+        if batch_index < debug_log_first_n_batches:
+            _log(
+                f"{epoch_name} batch_flattened index={batch_index} "
+                f"flat_pairs_shape={tuple(flat_pairs.shape)}"
+            )
         score_logits, refinement = model(flat_pairs)
         assert refinement is not None
         delta_quaternions, _ = refinement
@@ -655,6 +721,12 @@ def _run_epoch(
         totals["refined_rotation_mean_deg"] += refined_summary["rotation_mean_deg"] * batch_size
         totals["refined_rotation_folded_mean_deg"] += float(refined_rotation_folded.mean().cpu()) * batch_size
         total_count += batch_size
+        if batch_index < debug_log_first_n_batches:
+            _log(
+                f"{epoch_name} batch_done index={batch_index} "
+                f"loss={float(loss.detach().cpu()):.4f} "
+                f"score_acc={score_accuracy:.4f}"
+            )
 
     return {key: value / total_count for key, value in totals.items()}
 
@@ -722,23 +794,37 @@ def train_benchmark_refiner(
     device: str,
     output_dir: str | Path,
     seed: int,
+    debug_log_first_n_samples: int = 2,
+    debug_log_first_n_batches: int = 2,
+    debug_render_smoke_test: bool = False,
 ) -> None:
+    _log(
+        f"startup dataset_root={dataset_root} device={device} "
+        f"cuda_available={torch.cuda.is_available()}"
+    )
     candidate_satellite_name = candidate_satellite or mesh_satellite
     output_root = ensure_dir(Path(output_dir) / f"{query_satellite}__mesh_{mesh_satellite}__train")
+    _log(f"output_dir={output_root}")
 
     camera_config = load_camera_config(dataset_root)
     query_ds = SPE3RSatellite(dataset_root, query_satellite)
     mesh_ds = SPE3RSatellite(dataset_root, mesh_satellite)
     candidate_ds = SPE3RSatellite(dataset_root, candidate_satellite_name)
+    _log(
+        f"satellites query={query_satellite} mesh={mesh_satellite} "
+        f"candidate={candidate_satellite_name}"
+    )
     mesh_symmetry_group = None
     mesh_symmetry_group_tensor = None
     if use_mesh_symmetry_group:
+        _log("building mesh symmetry group")
         mesh_symmetry_group = build_mesh_rotation_symmetry_group(
             query_ds.model_path,
             threshold=mesh_symmetry_threshold,
             max_points=mesh_symmetry_max_points,
             seed=seed,
         )
+        _log(f"mesh symmetry group ready size={len(mesh_symmetry_group['quaternions_xyzw'])}")
         mesh_symmetry_group_tensor = torch.as_tensor(
             np.asarray(mesh_symmetry_group["quaternions_xyzw"], dtype=np.float32),
             device=device,
@@ -747,6 +833,10 @@ def train_benchmark_refiner(
     train_records = subsample_records(query_ds.select_records(train_split), max_train_samples, strategy="even", seed=seed)
     eval_records = subsample_records(query_ds.select_records(eval_split), max_eval_samples, strategy="even", seed=seed)
     base_candidates = subsample_records(candidate_ds.select_records(train_split), max_candidate_samples, strategy="even", seed=seed)
+    _log(
+        f"record_counts train={len(train_records)} eval={len(eval_records)} "
+        f"base_candidates={len(base_candidates)}"
+    )
     coarse_candidates = build_coarse_candidate_bank(
         base_candidates,
         use_dataset_bank=use_dataset_bank,
@@ -755,6 +845,10 @@ def train_benchmark_refiner(
         grid_elevation_bins=grid_elevation_bins,
         grid_roll_bins=grid_roll_bins,
         grid_radius_samples=grid_radius_samples,
+    )
+    _log(
+        f"coarse_candidate_bank size={len(coarse_candidates)} "
+        f"use_dataset_bank={use_dataset_bank} use_structured_bank={use_structured_bank}"
     )
 
     train_dataset = ShortlistRefinerDataset(
@@ -773,6 +867,9 @@ def train_benchmark_refiner(
         mesh_symmetry_group_quaternions_xyzw=(mesh_symmetry_group or {}).get("quaternions_xyzw"),
         samples_per_epoch=samples_per_epoch,
         seed=seed,
+        enable_debug_logging=debug_log_first_n_samples > 0,
+        debug_log_first_n_samples=debug_log_first_n_samples,
+        debug_name="train",
     )
     eval_dataset = ShortlistRefinerDataset(
         query_ds,
@@ -790,9 +887,27 @@ def train_benchmark_refiner(
         mesh_symmetry_group_quaternions_xyzw=(mesh_symmetry_group or {}).get("quaternions_xyzw"),
         samples_per_epoch=eval_samples,
         seed=seed + 10000,
+        enable_debug_logging=debug_log_first_n_samples > 0,
+        debug_log_first_n_samples=debug_log_first_n_samples,
+        debug_name="eval",
     )
+    _log(
+        f"datasets ready train_len={len(train_dataset)} eval_len={len(eval_dataset)} "
+        f"shortlist_size={shortlist_size} image_size={image_size}"
+    )
+    if debug_render_smoke_test:
+        _log("running dataset smoke test on first training sample")
+        sample = train_dataset[0]
+        _log(
+            f"smoke test success pairs_shape={tuple(sample['pairs'].shape)} "
+            f"filename={sample['filename']}"
+        )
     train_loader = _build_loader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     eval_loader = _build_loader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    _log(
+        f"dataloaders ready batch_size={batch_size} num_workers={num_workers} "
+        f"pin_memory={torch.cuda.is_available()}"
+    )
 
     model = MeshPoseScoringModel(
         input_channels=9,
@@ -802,7 +917,10 @@ def train_benchmark_refiner(
         rotation_only_refinement=True,
         translation_refinement_scale=0.0,
     ).to(device)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    _log(f"model ready parameters={parameter_count}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    _log(f"optimizer ready lr={learning_rate} weight_decay={weight_decay}")
 
     history_rows = []
     best_state = None
@@ -810,6 +928,7 @@ def train_benchmark_refiner(
     best_epoch = 0
 
     for epoch in range(1, epochs + 1):
+        _log(f"epoch_start epoch={epoch}")
         train_summary = _run_epoch(
             model,
             train_loader,
@@ -818,6 +937,8 @@ def train_benchmark_refiner(
             refine_weight=refine_weight,
             fold_halfturn_symmetry_loss=fold_halfturn_symmetry_loss,
             mesh_symmetry_group_tensor=mesh_symmetry_group_tensor,
+            epoch_name=f"train/epoch_{epoch}",
+            debug_log_first_n_batches=debug_log_first_n_batches,
             optimizer=optimizer,
         )
         eval_summary = _run_epoch(
@@ -828,6 +949,8 @@ def train_benchmark_refiner(
             refine_weight=refine_weight,
             fold_halfturn_symmetry_loss=fold_halfturn_symmetry_loss,
             mesh_symmetry_group_tensor=mesh_symmetry_group_tensor,
+            epoch_name=f"eval/epoch_{epoch}",
+            debug_log_first_n_batches=debug_log_first_n_batches,
             optimizer=None,
         )
         row = {
@@ -848,8 +971,8 @@ def train_benchmark_refiner(
             "eval_refined_rotation_folded_mean_deg": f"{eval_summary['refined_rotation_folded_mean_deg']:.6f}",
         }
         history_rows.append(row)
-        print(
-            f"[epoch {epoch:02d}/{epochs:02d}] "
+        _log(
+            f"epoch_done epoch={epoch} "
             f"train_loss={train_summary['loss']:.4f} "
             f"eval_loss={eval_summary['loss']:.4f} "
             f"train_acc={train_summary['score_accuracy']:.4f} "
@@ -894,11 +1017,14 @@ def train_benchmark_refiner(
                 "best_epoch": epoch,
                 "mesh_symmetry_group": mesh_symmetry_group,
             }
+            _log(f"new_best epoch={epoch} eval_loss={best_eval_loss:.4f}")
 
     if best_state is None:
         raise RuntimeError("Training did not produce a checkpoint.")
 
-    torch.save(best_state, output_root / "best_model.pt")
+    checkpoint_path = output_root / "best_model.pt"
+    torch.save(best_state, checkpoint_path)
+    _log(f"saved checkpoint path={checkpoint_path}")
     write_csv(output_root / "history.csv", list(history_rows[0].keys()), history_rows)
     _save_history_plot(history_rows, output_root / "training_curves.png")
     write_json(
@@ -914,6 +1040,7 @@ def train_benchmark_refiner(
             "config": best_state["config"],
         },
     )
+    _log(f"finished best_epoch={best_epoch} best_eval_loss={best_eval_loss:.4f}")
 
 
 def build_coarse_shortlist_from_geometry(
