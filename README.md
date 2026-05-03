@@ -220,3 +220,27 @@ python3 scripts/run_classification_eval.py \
   --split-mode satellite \
   --output-dir outputs/classification_sat_holdout_v6_eval
 ```
+1. Run classifier on an image
+```bash
+python3 scripts/run_classification_predict.py \
+  --checkpoint outputs/classification_sat_holdout_v6/best_model.pt \
+  --image /absolute/path/to/query_image.jpg \
+  --top-k 1
+```
+
+2. Get all satellites in that predicted class
+Suppose prediction is: Box Bus + Solar Wings
+Then list satellites from classification.csv with this command:
+```bash
+python3 - <<'PY'
+import csv
+target_class = "Box Bus + Solar Wings"  # replace with predicted class string
+with open("classification.csv", newline="") as f:
+    rows = list(csv.DictReader(f))
+matches = [r["satellite_name"] for r in rows if r["architecture_label"].strip() == target_class]
+print(f"class: {target_class}")
+print(f"count: {len(matches)}")
+for name in matches:
+    print(name)
+PY
+```
