@@ -40,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--score-weight", type=float, default=1.0)
     parser.add_argument("--refine-weight", type=float, default=1.0)
+    parser.add_argument("--fold-halfturn-symmetry-loss", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--use-mesh-symmetry-group", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mesh-symmetry-threshold", type=float, default=0.03)
+    parser.add_argument("--mesh-symmetry-max-points", type=int, default=5000)
     parser.add_argument("--use-dataset-bank", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-structured-bank", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--grid-azimuth-bins", type=int, default=24)
@@ -85,6 +89,10 @@ def main() -> None:
         weight_decay=args.weight_decay,
         score_weight=args.score_weight,
         refine_weight=args.refine_weight,
+        fold_halfturn_symmetry_loss=args.fold_halfturn_symmetry_loss,
+        use_mesh_symmetry_group=args.use_mesh_symmetry_group,
+        mesh_symmetry_threshold=args.mesh_symmetry_threshold,
+        mesh_symmetry_max_points=args.mesh_symmetry_max_points,
         use_dataset_bank=args.use_dataset_bank,
         use_structured_bank=args.use_structured_bank,
         grid_azimuth_bins=args.grid_azimuth_bins,

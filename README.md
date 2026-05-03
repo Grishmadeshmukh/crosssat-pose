@@ -76,6 +76,7 @@ Train the benchmark-aligned shortlist refiner. This uses:
 - object-centric crops for query and render pairs
 - listwise shortlist supervision instead of binary scoring
 - rotation-only refinement, since translation refinement was unstable in the trial repo
+- optional symmetry-aware supervision from the query satellite's detected mesh rotation symmetry group
 
 ```bash
 python3 scripts/train_benchmark_refiner.py \
@@ -90,6 +91,27 @@ this writes the checkpoint and training curves to:
 
 ```bash
 outputs/benchmark_refiner/jason-1_final__mesh_jason-1_final__train/
+```
+
+training now logs one line per epoch with:
+
+- train/eval loss
+- train/eval shortlist accuracy
+- eval mean rotation error
+- eval folded half-turn rotation error
+
+train the symmetry-aware version that uses the query satellite's detected mesh symmetry group:
+
+```bash
+python3 scripts/train_benchmark_refiner.py \
+  --query-satellite jason-1_final \
+  --mesh-satellite jason-1_final \
+  --candidate-satellite jason-1_final \
+  --use-dataset-bank \
+  --use-structured-bank \
+  --use-mesh-symmetry-group \
+  --mesh-symmetry-threshold 0.03 \
+  --output-dir outputs/benchmark_refiner_meshsym
 ```
 
 eval the benchmark refiner on the same satellite:
@@ -117,6 +139,29 @@ python3 scripts/evaluate_benchmark_refiner.py \
   --use-structured-bank \
   --iterations 3
 ```
+
+eval the symmetry-aware benchmark and report both standard and symmetry-aware rotation errors:
+
+```bash
+python3 scripts/evaluate_benchmark_refiner.py \
+  --checkpoint outputs/benchmark_refiner_meshsym/jason-1_final__mesh_jason-1_final__train/best_model.pt \
+  --query-satellite jason-1_final \
+  --mesh-satellite jason-1_final \
+  --candidate-satellite jason-1_final \
+  --use-dataset-bank \
+  --use-structured-bank \
+  --use-mesh-symmetry-group \
+  --mesh-symmetry-threshold 0.03 \
+  --iterations 3 \
+  --output-dir outputs/benchmark_pose_search_meshsym
+```
+
+the benchmark evaluator now writes:
+
+- standard rotation error
+- folded half-turn rotation error
+- mesh-symmetry-aware rotation error
+- counts of likely symmetry-driven failures
 
 ## output folders
 

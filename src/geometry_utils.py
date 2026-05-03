@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Iterable
 
 import numpy as np
 
@@ -26,6 +27,36 @@ def quaternion_to_matrix(quaternion_xyzw: np.ndarray) -> np.ndarray:
         ],
         dtype=np.float64,
     )
+
+
+def matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    trace = np.trace(matrix)
+    if trace > 0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * scale
+        x = (matrix[2, 1] - matrix[1, 2]) / scale
+        y = (matrix[0, 2] - matrix[2, 0]) / scale
+        z = (matrix[1, 0] - matrix[0, 1]) / scale
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        scale = math.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+        w = (matrix[2, 1] - matrix[1, 2]) / scale
+        x = 0.25 * scale
+        y = (matrix[0, 1] + matrix[1, 0]) / scale
+        z = (matrix[0, 2] + matrix[2, 0]) / scale
+    elif matrix[1, 1] > matrix[2, 2]:
+        scale = math.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+        w = (matrix[0, 2] - matrix[2, 0]) / scale
+        x = (matrix[0, 1] + matrix[1, 0]) / scale
+        y = 0.25 * scale
+        z = (matrix[1, 2] + matrix[2, 1]) / scale
+    else:
+        scale = math.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+        w = (matrix[1, 0] - matrix[0, 1]) / scale
+        x = (matrix[0, 2] + matrix[2, 0]) / scale
+        y = (matrix[1, 2] + matrix[2, 1]) / scale
+        z = 0.25 * scale
+    return normalize_quaternion(np.asarray([x, y, z, w], dtype=np.float64))
 
 
 def quaternion_to_euler_degrees(quaternion_xyzw: np.ndarray) -> np.ndarray:
@@ -101,6 +132,25 @@ def rotation_error_degrees(quaternion_a: np.ndarray, quaternion_b: np.ndarray) -
     quat_b = normalize_quaternion(quaternion_b)
     dot = float(np.clip(abs(np.dot(quat_a, quat_b)), 0.0, 1.0))
     return math.degrees(2.0 * math.acos(dot))
+
+
+def fold_halfturn_rotation_error_degrees(rotation_error_deg: float) -> float:
+    rotation_error_deg = float(rotation_error_deg)
+    return min(rotation_error_deg, 180.0 - rotation_error_deg)
+
+
+def symmetry_group_rotation_error_degrees(
+    quaternion_a: np.ndarray,
+    quaternion_b: np.ndarray,
+    symmetry_group_quaternions_xyzw: Iterable[np.ndarray] | None,
+) -> float:
+    if not symmetry_group_quaternions_xyzw:
+        return rotation_error_degrees(quaternion_a, quaternion_b)
+    best_error = float("inf")
+    for symmetry_quaternion in symmetry_group_quaternions_xyzw:
+        equivalent_target = quaternion_multiply(quaternion_b, symmetry_quaternion)
+        best_error = min(best_error, rotation_error_degrees(quaternion_a, equivalent_target))
+    return best_error
 
 
 def translation_distance(vector_a: np.ndarray, vector_b: np.ndarray) -> float:

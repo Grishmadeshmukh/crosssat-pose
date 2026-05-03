@@ -34,6 +34,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coarse-shortlist-size", type=int, default=32)
     parser.add_argument("--keep-top-k", type=int, default=8)
     parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--use-mesh-symmetry-group", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mesh-symmetry-threshold", type=float, default=0.03)
+    parser.add_argument("--mesh-symmetry-max-points", type=int, default=5000)
     parser.add_argument("--num-visualizations", type=int, default=8)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output-dir", default=default_output_root("benchmark_pose_search"))
@@ -67,6 +70,9 @@ def main() -> None:
         coarse_shortlist_size=args.coarse_shortlist_size,
         keep_top_k=args.keep_top_k,
         iterations=args.iterations,
+        use_mesh_symmetry_group=args.use_mesh_symmetry_group,
+        mesh_symmetry_threshold=args.mesh_symmetry_threshold,
+        mesh_symmetry_max_points=args.mesh_symmetry_max_points,
         num_visualizations=args.num_visualizations,
         device=device,
         output_dir=args.output_dir,

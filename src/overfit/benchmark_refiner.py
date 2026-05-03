@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader, Dataset
 
 from common import ensure_dir, write_csv, write_json, write_text
@@ -20,11 +21,14 @@ from data_utils import PoseRecord, SPE3RSatellite, load_camera_config, subsample
 from geometry_utils import (
     camera_positions_in_body_frame,
     cartesian_to_spherical,
+    fold_halfturn_rotation_error_degrees,
+    matrix_to_quaternion,
     pose_from_camera_position,
     quaternion_inverse,
     quaternion_multiply,
     rotation_error_degrees,
     spherical_to_cartesian,
+    symmetry_group_rotation_error_degrees,
     translation_distance,
 )
 from models import MeshPoseScoringModel
@@ -131,6 +135,90 @@ def summarize_pose_errors(
     }
 
 
+def load_obj_vertices(path: str | Path) -> np.ndarray:
+    vertices = []
+    with Path(path).open() as handle:
+        for line in handle:
+            if not line.startswith("v "):
+                continue
+            _, x_value, y_value, z_value, *_ = line.split()
+            vertices.append((float(x_value), float(y_value), float(z_value)))
+    if not vertices:
+        raise ValueError(f"No vertices found in {path}")
+    return np.asarray(vertices, dtype=np.float32)
+
+
+def _center_scale_pca(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    centered = points - points.mean(axis=0, keepdims=True)
+    _, _, right_singular_vectors = np.linalg.svd(centered, full_matrices=False)
+    aligned = centered @ right_singular_vectors.T
+    radius = np.linalg.norm(aligned, axis=1).max()
+    if radius > 0:
+        aligned = aligned / radius
+    return aligned, right_singular_vectors
+
+
+def build_mesh_rotation_symmetry_group(
+    mesh_path: str | Path,
+    *,
+    threshold: float,
+    max_points: int = 5000,
+    seed: int = 42,
+) -> dict[str, object]:
+    rng = np.random.default_rng(seed)
+    points = load_obj_vertices(mesh_path)
+    if len(points) > max_points:
+        selection = rng.choice(len(points), size=max_points, replace=False)
+        points = points[selection]
+    aligned, pca_basis = _center_scale_pca(points)
+    tree = cKDTree(aligned)
+
+    aligned_rotations = {
+        "x": np.asarray([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]], dtype=np.float64),
+        "y": np.asarray([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]], dtype=np.float64),
+        "z": np.asarray([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+    }
+
+    generator_quaternions: list[np.ndarray] = []
+    generator_axes: list[str] = []
+    generator_scores: dict[str, float] = {}
+    for axis_name, aligned_rotation in aligned_rotations.items():
+        rotated = aligned @ aligned_rotation.T
+        distances, _ = tree.query(rotated, k=1)
+        score = float(distances.mean())
+        generator_scores[axis_name] = score
+        if score <= threshold:
+            body_rotation = pca_basis.T @ aligned_rotation @ pca_basis
+            generator_quaternions.append(matrix_to_quaternion(body_rotation).astype(np.float32))
+            generator_axes.append(axis_name)
+
+    identity = np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    group = [identity]
+    labels = ["identity"]
+    queue = [(identity, "identity")]
+    eps = 1e-4
+
+    while queue:
+        current, current_label = queue.pop(0)
+        for generator, axis_name in zip(generator_quaternions, generator_axes):
+            candidate = quaternion_multiply(current, generator).astype(np.float32)
+            exists = any(abs(float(np.dot(existing, candidate))) >= 1.0 - eps for existing in group)
+            if exists:
+                continue
+            label = f"{current_label}*rot180_{axis_name}"
+            group.append(candidate)
+            labels.append(label)
+            queue.append((candidate, label))
+
+    return {
+        "threshold": threshold,
+        "generator_axes": generator_axes,
+        "generator_scores": generator_scores,
+        "quaternions_xyzw": group,
+        "labels": labels,
+    }
+
+
 def shortlist_soft_targets(rotation_errors_deg: np.ndarray, *, temperature_deg: float) -> np.ndarray:
     scaled = -np.asarray(rotation_errors_deg, dtype=np.float64) / max(temperature_deg, 1e-6)
     scaled -= scaled.max()
@@ -140,6 +228,47 @@ def shortlist_soft_targets(rotation_errors_deg: np.ndarray, *, temperature_deg: 
 
 def relative_delta_quaternion(seed_quaternion_xyzw: np.ndarray, target_quaternion_xyzw: np.ndarray) -> np.ndarray:
     return quaternion_multiply(target_quaternion_xyzw, quaternion_inverse(seed_quaternion_xyzw)).astype(np.float32)
+
+
+def fold_halfturn_rotation_error_torch(rotation_errors_deg: torch.Tensor) -> torch.Tensor:
+    return torch.minimum(rotation_errors_deg, 180.0 - rotation_errors_deg)
+
+
+def quaternion_multiply_torch(quaternion_a: torch.Tensor, quaternion_b: torch.Tensor) -> torch.Tensor:
+    ax, ay, az, aw = F.normalize(quaternion_a, dim=-1).unbind(dim=-1)
+    bx, by, bz, bw = F.normalize(quaternion_b, dim=-1).unbind(dim=-1)
+    return F.normalize(
+        torch.stack(
+            [
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+                aw * bw - ax * bx - ay * by - az * bz,
+            ],
+            dim=-1,
+        ),
+        dim=-1,
+    )
+
+
+def symmetry_group_rotation_errors_torch(
+    predicted_quaternion_xyzw: torch.Tensor,
+    target_quaternion_xyzw: torch.Tensor,
+    symmetry_group_quaternions_xyzw: torch.Tensor | None,
+) -> torch.Tensor:
+    predicted = F.normalize(predicted_quaternion_xyzw, dim=-1)
+    target = F.normalize(target_quaternion_xyzw, dim=-1)
+    if symmetry_group_quaternions_xyzw is None or symmetry_group_quaternions_xyzw.numel() == 0:
+        dots = (predicted * target).sum(dim=-1).abs().clamp(0.0, 1.0)
+        return 2.0 * torch.rad2deg(torch.acos(dots))
+
+    errors = []
+    for symmetry_quaternion in symmetry_group_quaternions_xyzw:
+        expanded = symmetry_quaternion.view(*([1] * (target.dim() - 1)), 4).expand_as(target)
+        equivalent_target = quaternion_multiply_torch(target, expanded)
+        dots = (predicted * equivalent_target).sum(dim=-1).abs().clamp(0.0, 1.0)
+        errors.append(2.0 * torch.rad2deg(torch.acos(dots)))
+    return torch.stack(errors, dim=-1).min(dim=-1).values
 
 
 def build_structured_pose_bank(
@@ -232,6 +361,8 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
         close_pool_size: int = 32,
         score_temperature_deg: float = 20.0,
         refine_top_m: int = 4,
+        fold_halfturn_symmetry_targets: bool = False,
+        mesh_symmetry_group_quaternions_xyzw: Sequence[np.ndarray] | None = None,
         samples_per_epoch: int = 2048,
         seed: int = 42,
     ):
@@ -246,6 +377,11 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
         self.close_pool_size = close_pool_size
         self.score_temperature_deg = score_temperature_deg
         self.refine_top_m = refine_top_m
+        self.fold_halfturn_symmetry_targets = fold_halfturn_symmetry_targets
+        self.mesh_symmetry_group_quaternions_xyzw = [
+            np.asarray(quaternion_xyzw, dtype=np.float32)
+            for quaternion_xyzw in (mesh_symmetry_group_quaternions_xyzw or [])
+        ]
         self.samples_per_epoch = samples_per_epoch
         self.seed = seed
         self._renderer: MeshRenderer | None = None
@@ -292,6 +428,7 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
         seed_quaternions = []
         seed_translations = []
         rotation_errors = []
+        symmetry_rotation_errors = []
         delta_quaternions = []
 
         for candidate in shortlist:
@@ -309,11 +446,41 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
             seed_quaternions.append(np.asarray(candidate.quaternion_xyzw, dtype=np.float32))
             seed_translations.append(np.asarray(candidate.translation, dtype=np.float32))
             rotation_errors.append(rotation_error_degrees(candidate.quaternion_xyzw, query_record.quaternion_xyzw))
-            delta_quaternions.append(relative_delta_quaternion(candidate.quaternion_xyzw, query_record.quaternion_xyzw))
+            symmetry_error = symmetry_group_rotation_error_degrees(
+                candidate.quaternion_xyzw,
+                query_record.quaternion_xyzw,
+                self.mesh_symmetry_group_quaternions_xyzw,
+            )
+            symmetry_rotation_errors.append(symmetry_error)
+            if self.mesh_symmetry_group_quaternions_xyzw:
+                equivalent_targets = [
+                    quaternion_multiply(query_record.quaternion_xyzw, symmetry_quaternion)
+                    for symmetry_quaternion in self.mesh_symmetry_group_quaternions_xyzw
+                ]
+                best_target = min(
+                    equivalent_targets,
+                    key=lambda equivalent: rotation_error_degrees(candidate.quaternion_xyzw, equivalent),
+                )
+            else:
+                best_target = query_record.quaternion_xyzw
+            delta_quaternions.append(relative_delta_quaternion(candidate.quaternion_xyzw, best_target))
 
         rotation_errors_np = np.asarray(rotation_errors, dtype=np.float32)
-        soft_targets = shortlist_soft_targets(rotation_errors_np, temperature_deg=self.score_temperature_deg).astype(np.float32)
-        refine_order = np.argsort(rotation_errors_np)
+        symmetry_rotation_errors_np = np.asarray(symmetry_rotation_errors, dtype=np.float32)
+        folded_rotation_errors_np = np.asarray(
+            [fold_halfturn_rotation_error_degrees(error) for error in rotation_errors_np],
+            dtype=np.float32,
+        )
+        supervision_rotation_errors = (
+            symmetry_rotation_errors_np if self.mesh_symmetry_group_quaternions_xyzw else (
+                folded_rotation_errors_np if self.fold_halfturn_symmetry_targets else rotation_errors_np
+            )
+        )
+        soft_targets = shortlist_soft_targets(
+            supervision_rotation_errors,
+            temperature_deg=self.score_temperature_deg,
+        ).astype(np.float32)
+        refine_order = np.argsort(supervision_rotation_errors)
         refine_weights = np.zeros_like(rotation_errors_np, dtype=np.float32)
         refine_weights[refine_order[: min(self.refine_top_m, len(refine_order))]] = 1.0
         refine_weights_sum = float(refine_weights.sum())
@@ -330,6 +497,8 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
             "score_targets": torch.from_numpy(soft_targets),
             "refine_weights": torch.from_numpy(refine_weights),
             "candidate_rotation_errors_deg": torch.from_numpy(rotation_errors_np),
+            "candidate_folded_rotation_errors_deg": torch.from_numpy(folded_rotation_errors_np),
+            "candidate_mesh_symmetry_rotation_errors_deg": torch.from_numpy(symmetry_rotation_errors_np),
             "filename": query_record.filename,
         }
 
@@ -341,21 +510,32 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
 
 def shortlist_refinement_loss(
     score_logits: torch.Tensor,
-    predicted_delta_quaternions: torch.Tensor,
-    target_delta_quaternions: torch.Tensor,
+    predicted_refined_quaternions: torch.Tensor,
+    target_quaternions: torch.Tensor,
     score_targets: torch.Tensor,
     refine_weights: torch.Tensor,
     *,
     score_weight: float,
     refine_weight: float,
+    fold_halfturn_symmetry: bool = False,
+    mesh_symmetry_group_quaternions_xyzw: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_probs = F.log_softmax(score_logits, dim=-1)
     score_loss = -(score_targets * log_probs).sum(dim=-1).mean()
 
-    pred = F.normalize(predicted_delta_quaternions, dim=-1)
-    target = F.normalize(target_delta_quaternions, dim=-1)
-    dots = (pred * target).sum(dim=-1).abs().clamp(0.0, 1.0)
-    rotation_errors = 2.0 * torch.rad2deg(torch.acos(dots))
+    if mesh_symmetry_group_quaternions_xyzw is not None and mesh_symmetry_group_quaternions_xyzw.numel() > 0:
+        rotation_errors = symmetry_group_rotation_errors_torch(
+            predicted_refined_quaternions,
+            target_quaternions,
+            mesh_symmetry_group_quaternions_xyzw,
+        )
+    else:
+        pred = F.normalize(predicted_refined_quaternions, dim=-1)
+        target = F.normalize(target_quaternions, dim=-1)
+        dots = (pred * target).sum(dim=-1).abs().clamp(0.0, 1.0)
+        rotation_errors = 2.0 * torch.rad2deg(torch.acos(dots))
+    if fold_halfturn_symmetry and (mesh_symmetry_group_quaternions_xyzw is None or mesh_symmetry_group_quaternions_xyzw.numel() == 0):
+        rotation_errors = fold_halfturn_rotation_error_torch(rotation_errors)
     weighted_rotation = (rotation_errors * refine_weights).sum(dim=-1).mean() / 180.0
 
     total = score_weight * score_loss + refine_weight * weighted_rotation
@@ -392,6 +572,8 @@ def _run_epoch(
     device: str,
     score_weight: float,
     refine_weight: float,
+    fold_halfturn_symmetry_loss: bool,
+    mesh_symmetry_group_tensor: torch.Tensor | None,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
@@ -403,6 +585,7 @@ def _run_epoch(
         "score_accuracy": 0.0,
         "candidate_rotation_mean_deg": 0.0,
         "refined_rotation_mean_deg": 0.0,
+        "refined_rotation_folded_mean_deg": 0.0,
     }
     total_count = 0
 
@@ -414,14 +597,20 @@ def _run_epoch(
         delta_quaternions, _ = refinement
         score_logits = score_logits.view(batch_size, shortlist_size)
         delta_quaternions = delta_quaternions.view(batch_size, shortlist_size, 4)
+        refined_quaternions = apply_delta_quaternion_torch(
+            seed_quaternions.view(batch_size, shortlist_size, 4),
+            delta_quaternions,
+        )
         loss, terms = shortlist_refinement_loss(
             score_logits,
-            delta_quaternions,
-            batch["target_delta_quaternions"].to(device),
+            refined_quaternions,
+            batch["target_quaternion"].to(device).unsqueeze(1).expand_as(refined_quaternions),
             batch["score_targets"].to(device),
             batch["refine_weights"].to(device),
             score_weight=score_weight,
             refine_weight=refine_weight,
+            fold_halfturn_symmetry=fold_halfturn_symmetry_loss,
+            mesh_symmetry_group_quaternions_xyzw=mesh_symmetry_group_tensor,
         )
 
         if is_train:
@@ -430,10 +619,6 @@ def _run_epoch(
             optimizer.step()
 
         with torch.no_grad():
-            refined_quaternions = apply_delta_quaternion_torch(
-                seed_quaternions.view(batch_size, shortlist_size, 4),
-                delta_quaternions,
-            )
             weights = batch["refine_weights"].to(device)
             target_quaternion = batch["target_quaternion"].to(device).unsqueeze(1).expand_as(refined_quaternions)
             target_translation = batch["target_translation"].to(device).unsqueeze(1).expand_as(
@@ -445,10 +630,22 @@ def _run_epoch(
                 target_quaternion.reshape(-1, 4),
                 target_translation.reshape(-1, 3),
             )
+            dots = (refined_quaternions * target_quaternion).sum(dim=-1).abs().clamp(0.0, 1.0)
+            refined_rotation_errors = 2.0 * torch.rad2deg(torch.acos(dots))
+            refined_rotation_folded = fold_halfturn_rotation_error_torch(refined_rotation_errors)
             score_pred = score_logits.argmax(dim=-1)
             score_target = batch["score_targets"].to(device).argmax(dim=-1)
             score_accuracy = float((score_pred == score_target).float().mean().cpu())
-            candidate_rotation = (batch["candidate_rotation_errors_deg"].to(device) * weights).sum(dim=-1).mean()
+            candidate_rotation_source = (
+                batch["candidate_mesh_symmetry_rotation_errors_deg"].to(device)
+                if mesh_symmetry_group_tensor is not None
+                else (
+                    batch["candidate_folded_rotation_errors_deg"].to(device)
+                    if fold_halfturn_symmetry_loss
+                    else batch["candidate_rotation_errors_deg"].to(device)
+                )
+            )
+            candidate_rotation = (candidate_rotation_source * weights).sum(dim=-1).mean()
 
         totals["loss"] += float(loss.detach().cpu()) * batch_size
         totals["score_loss"] += terms["score_loss"] * batch_size
@@ -456,6 +653,7 @@ def _run_epoch(
         totals["score_accuracy"] += score_accuracy * batch_size
         totals["candidate_rotation_mean_deg"] += float(candidate_rotation.cpu()) * batch_size
         totals["refined_rotation_mean_deg"] += refined_summary["rotation_mean_deg"] * batch_size
+        totals["refined_rotation_folded_mean_deg"] += float(refined_rotation_folded.mean().cpu()) * batch_size
         total_count += batch_size
 
     return {key: value / total_count for key, value in totals.items()}
@@ -474,6 +672,8 @@ def _save_history_plot(history_rows: list[dict[str, object]], output_path: Path)
     axes[1].legend()
     axes[2].plot(epochs, [float(row["train_refined_rotation_mean_deg"]) for row in history_rows], label="train")
     axes[2].plot(epochs, [float(row["eval_refined_rotation_mean_deg"]) for row in history_rows], label="eval")
+    axes[2].plot(epochs, [float(row["train_refined_rotation_folded_mean_deg"]) for row in history_rows], label="train folded")
+    axes[2].plot(epochs, [float(row["eval_refined_rotation_folded_mean_deg"]) for row in history_rows], label="eval folded")
     axes[2].set_title("Refined rotation error")
     axes[2].legend()
     figure.tight_layout()
@@ -508,6 +708,10 @@ def train_benchmark_refiner(
     weight_decay: float,
     score_weight: float,
     refine_weight: float,
+    fold_halfturn_symmetry_loss: bool,
+    use_mesh_symmetry_group: bool,
+    mesh_symmetry_threshold: float,
+    mesh_symmetry_max_points: int,
     use_dataset_bank: bool,
     use_structured_bank: bool,
     grid_azimuth_bins: int,
@@ -526,6 +730,19 @@ def train_benchmark_refiner(
     query_ds = SPE3RSatellite(dataset_root, query_satellite)
     mesh_ds = SPE3RSatellite(dataset_root, mesh_satellite)
     candidate_ds = SPE3RSatellite(dataset_root, candidate_satellite_name)
+    mesh_symmetry_group = None
+    mesh_symmetry_group_tensor = None
+    if use_mesh_symmetry_group:
+        mesh_symmetry_group = build_mesh_rotation_symmetry_group(
+            query_ds.model_path,
+            threshold=mesh_symmetry_threshold,
+            max_points=mesh_symmetry_max_points,
+            seed=seed,
+        )
+        mesh_symmetry_group_tensor = torch.as_tensor(
+            np.asarray(mesh_symmetry_group["quaternions_xyzw"], dtype=np.float32),
+            device=device,
+        )
 
     train_records = subsample_records(query_ds.select_records(train_split), max_train_samples, strategy="even", seed=seed)
     eval_records = subsample_records(query_ds.select_records(eval_split), max_eval_samples, strategy="even", seed=seed)
@@ -552,6 +769,8 @@ def train_benchmark_refiner(
         close_pool_size=close_pool_size,
         score_temperature_deg=score_temperature_deg,
         refine_top_m=refine_top_m,
+        fold_halfturn_symmetry_targets=fold_halfturn_symmetry_loss,
+        mesh_symmetry_group_quaternions_xyzw=(mesh_symmetry_group or {}).get("quaternions_xyzw"),
         samples_per_epoch=samples_per_epoch,
         seed=seed,
     )
@@ -567,6 +786,8 @@ def train_benchmark_refiner(
         close_pool_size=close_pool_size,
         score_temperature_deg=score_temperature_deg,
         refine_top_m=refine_top_m,
+        fold_halfturn_symmetry_targets=fold_halfturn_symmetry_loss,
+        mesh_symmetry_group_quaternions_xyzw=(mesh_symmetry_group or {}).get("quaternions_xyzw"),
         samples_per_epoch=eval_samples,
         seed=seed + 10000,
     )
@@ -595,6 +816,8 @@ def train_benchmark_refiner(
             device=device,
             score_weight=score_weight,
             refine_weight=refine_weight,
+            fold_halfturn_symmetry_loss=fold_halfturn_symmetry_loss,
+            mesh_symmetry_group_tensor=mesh_symmetry_group_tensor,
             optimizer=optimizer,
         )
         eval_summary = _run_epoch(
@@ -603,6 +826,8 @@ def train_benchmark_refiner(
             device=device,
             score_weight=score_weight,
             refine_weight=refine_weight,
+            fold_halfturn_symmetry_loss=fold_halfturn_symmetry_loss,
+            mesh_symmetry_group_tensor=mesh_symmetry_group_tensor,
             optimizer=None,
         )
         row = {
@@ -613,14 +838,25 @@ def train_benchmark_refiner(
             "train_score_accuracy": f"{train_summary['score_accuracy']:.6f}",
             "train_candidate_rotation_mean_deg": f"{train_summary['candidate_rotation_mean_deg']:.6f}",
             "train_refined_rotation_mean_deg": f"{train_summary['refined_rotation_mean_deg']:.6f}",
+            "train_refined_rotation_folded_mean_deg": f"{train_summary['refined_rotation_folded_mean_deg']:.6f}",
             "eval_loss": f"{eval_summary['loss']:.6f}",
             "eval_score_loss": f"{eval_summary['score_loss']:.6f}",
             "eval_refine_loss": f"{eval_summary['refine_loss']:.6f}",
             "eval_score_accuracy": f"{eval_summary['score_accuracy']:.6f}",
             "eval_candidate_rotation_mean_deg": f"{eval_summary['candidate_rotation_mean_deg']:.6f}",
             "eval_refined_rotation_mean_deg": f"{eval_summary['refined_rotation_mean_deg']:.6f}",
+            "eval_refined_rotation_folded_mean_deg": f"{eval_summary['refined_rotation_folded_mean_deg']:.6f}",
         }
         history_rows.append(row)
+        print(
+            f"[epoch {epoch:02d}/{epochs:02d}] "
+            f"train_loss={train_summary['loss']:.4f} "
+            f"eval_loss={eval_summary['loss']:.4f} "
+            f"train_acc={train_summary['score_accuracy']:.4f} "
+            f"eval_acc={eval_summary['score_accuracy']:.4f} "
+            f"eval_rot={eval_summary['refined_rotation_mean_deg']:.2f} "
+            f"eval_fold={eval_summary['refined_rotation_folded_mean_deg']:.2f}"
+        )
         if eval_summary["loss"] < best_eval_loss:
             best_eval_loss = eval_summary["loss"]
             best_epoch = epoch
@@ -656,6 +892,7 @@ def train_benchmark_refiner(
                 "translation_refinement_scale": 0.0,
                 "crop_padding": crop_padding,
                 "best_epoch": epoch,
+                "mesh_symmetry_group": mesh_symmetry_group,
             }
 
     if best_state is None:
@@ -673,6 +910,7 @@ def train_benchmark_refiner(
             "best_epoch": best_epoch,
             "best_eval_loss": best_eval_loss,
             "output_dir": str(output_root),
+            "mesh_symmetry_group": mesh_symmetry_group,
             "config": best_state["config"],
         },
     )
@@ -796,7 +1034,7 @@ def _save_gallery(rows: list[dict[str, object]], output_path: Path) -> None:
         axes[row_index, 2].set_title(f"refined render\nscore={row['score']:.3f}", fontsize=9)
         axes[row_index, 3].imshow(_overlay_mask_on_image(row["query_rgb"], row["render_mask"]))
         axes[row_index, 3].set_title(
-            f"overlay\nrot={row['rotation_error_deg']:.1f} | trans={row['translation_error']:.3f}",
+            f"overlay\nrot={row['rotation_error_deg']:.1f} | fold={row['folded_halfturn_rotation_error_deg']:.1f} | trans={row['translation_error']:.3f}",
             fontsize=9,
         )
     figure.tight_layout()
@@ -817,8 +1055,12 @@ def _build_markdown_summary(metrics: dict[str, float], *, query_satellite: str, 
             f"- Coarse shortlist size: {int(metrics['coarse_shortlist_size'])}",
             f"- Refinement iterations: {int(metrics['iterations'])}",
             f"- Rotation mean / median / max (deg): {metrics['rotation_error_mean_deg']:.3f} / {metrics['rotation_error_median_deg']:.3f} / {metrics['rotation_error_max_deg']:.3f}",
+            f"- Folded half-turn rotation mean / median / max (deg): {metrics['folded_halfturn_rotation_error_mean_deg']:.3f} / {metrics['folded_halfturn_rotation_error_median_deg']:.3f} / {metrics['folded_halfturn_rotation_error_max_deg']:.3f}",
+            f"- Mesh-symmetry rotation mean / median / max (deg): {metrics['mesh_symmetry_rotation_error_mean_deg']:.3f} / {metrics['mesh_symmetry_rotation_error_median_deg']:.3f} / {metrics['mesh_symmetry_rotation_error_max_deg']:.3f}",
             f"- Translation mean / median / max: {metrics['translation_error_mean']:.3f} / {metrics['translation_error_median']:.3f} / {metrics['translation_error_max']:.3f}",
             f"- Mean shortlist score: {metrics['score_mean']:.3f}",
+            f"- Potential symmetry-driven failures (rot >= 120 deg but folded <= 30 deg): {int(metrics['potential_halfturn_symmetry_count'])}",
+            f"- Potential mesh-symmetry failures (rot >= 120 deg but mesh-sym <= 30 deg): {int(metrics['potential_mesh_symmetry_count'])}",
         ]
     )
 
@@ -844,6 +1086,9 @@ def evaluate_benchmark_refiner(
     coarse_shortlist_size: int,
     keep_top_k: int,
     iterations: int,
+    use_mesh_symmetry_group: bool,
+    mesh_symmetry_threshold: float,
+    mesh_symmetry_max_points: int,
     num_visualizations: int,
     device: str,
     output_dir: str | Path,
@@ -868,6 +1113,14 @@ def evaluate_benchmark_refiner(
     mesh_ds = SPE3RSatellite(dataset_root, mesh_satellite)
     candidate_ds = SPE3RSatellite(dataset_root, candidate_satellite_name)
     camera_config = load_camera_config(dataset_root)
+    mesh_symmetry_group = None
+    if use_mesh_symmetry_group:
+        mesh_symmetry_group = build_mesh_rotation_symmetry_group(
+            query_ds.model_path,
+            threshold=mesh_symmetry_threshold,
+            max_points=mesh_symmetry_max_points,
+            seed=seed,
+        )
 
     query_records = subsample_records(query_ds.select_records(query_split), max_query_samples, strategy="even", seed=seed)
     base_candidates = subsample_records(candidate_ds.select_records(candidate_split), max_candidate_samples, strategy=candidate_strategy, seed=seed)
@@ -885,6 +1138,8 @@ def evaluate_benchmark_refiner(
     retrieval_rows = []
     gallery_rows = []
     rotation_errors = []
+    folded_rotation_errors = []
+    mesh_symmetry_rotation_errors = []
     translation_errors = []
     scores = []
     crop_padding = int(checkpoint_payload.get("crop_padding", checkpoint_payload.get("config", {}).get("crop_padding", 12)))
@@ -917,8 +1172,16 @@ def evaluate_benchmark_refiner(
             )
             prediction = refined[0]
             rotation_error = rotation_error_degrees(prediction.quaternion_xyzw, query_record.quaternion_xyzw)
+            folded_rotation_error = fold_halfturn_rotation_error_degrees(rotation_error)
+            mesh_symmetry_rotation_error = symmetry_group_rotation_error_degrees(
+                prediction.quaternion_xyzw,
+                query_record.quaternion_xyzw,
+                (mesh_symmetry_group or {}).get("quaternions_xyzw"),
+            )
             translation_error = translation_distance(prediction.translation, query_record.translation)
             rotation_errors.append(rotation_error)
+            folded_rotation_errors.append(folded_rotation_error)
+            mesh_symmetry_rotation_errors.append(mesh_symmetry_rotation_error)
             translation_errors.append(translation_error)
             scores.append(prediction.score)
             retrieval_rows.append(
@@ -927,6 +1190,10 @@ def evaluate_benchmark_refiner(
                     "best_source_filename": prediction.source_filename or "",
                     "score": f"{prediction.score:.6f}",
                     "rotation_error_deg": f"{rotation_error:.6f}",
+                    "folded_halfturn_rotation_error_deg": f"{folded_rotation_error:.6f}",
+                    "halfturn_symmetry_gain_deg": f"{rotation_error - folded_rotation_error:.6f}",
+                    "mesh_symmetry_rotation_error_deg": f"{mesh_symmetry_rotation_error:.6f}",
+                    "mesh_symmetry_gain_deg": f"{rotation_error - mesh_symmetry_rotation_error:.6f}",
                     "translation_error": f"{translation_error:.6f}",
                     "pred_quaternion": " ".join(f"{value:.6f}" for value in prediction.quaternion_xyzw.tolist()),
                     "pred_translation": " ".join(f"{value:.6f}" for value in prediction.translation.tolist()),
@@ -943,6 +1210,7 @@ def evaluate_benchmark_refiner(
                         "render_mask": prediction.render_mask,
                         "score": prediction.score,
                         "rotation_error_deg": rotation_error,
+                        "folded_halfturn_rotation_error_deg": folded_rotation_error,
                         "translation_error": translation_error,
                     }
                 )
@@ -960,6 +1228,20 @@ def evaluate_benchmark_refiner(
         "rotation_error_mean_deg": float(np.mean(rotation_errors)),
         "rotation_error_median_deg": float(np.median(rotation_errors)),
         "rotation_error_max_deg": float(np.max(rotation_errors)),
+        "folded_halfturn_rotation_error_mean_deg": float(np.mean(folded_rotation_errors)),
+        "folded_halfturn_rotation_error_median_deg": float(np.median(folded_rotation_errors)),
+        "folded_halfturn_rotation_error_max_deg": float(np.max(folded_rotation_errors)),
+        "mesh_symmetry_rotation_error_mean_deg": float(np.mean(mesh_symmetry_rotation_errors)),
+        "mesh_symmetry_rotation_error_median_deg": float(np.median(mesh_symmetry_rotation_errors)),
+        "mesh_symmetry_rotation_error_max_deg": float(np.max(mesh_symmetry_rotation_errors)),
+        "halfturn_symmetry_gain_mean_deg": float(np.mean(np.asarray(rotation_errors) - np.asarray(folded_rotation_errors))),
+        "mesh_symmetry_gain_mean_deg": float(np.mean(np.asarray(rotation_errors) - np.asarray(mesh_symmetry_rotation_errors))),
+        "potential_halfturn_symmetry_count": int(
+            np.sum((np.asarray(rotation_errors) >= 120.0) & (np.asarray(folded_rotation_errors) <= 30.0))
+        ),
+        "potential_mesh_symmetry_count": int(
+            np.sum((np.asarray(rotation_errors) >= 120.0) & (np.asarray(mesh_symmetry_rotation_errors) <= 30.0))
+        ),
         "translation_error_mean": float(np.mean(translation_errors)),
         "translation_error_median": float(np.median(translation_errors)),
         "translation_error_max": float(np.max(translation_errors)),
@@ -970,6 +1252,7 @@ def evaluate_benchmark_refiner(
         "score_mean": float(np.mean(scores)),
         "score_median": float(np.median(scores)),
         "checkpoint": str(checkpoint),
+        "mesh_symmetry_group": mesh_symmetry_group,
     }
     write_csv(
         output_root / "retrievals.csv",
@@ -978,6 +1261,10 @@ def evaluate_benchmark_refiner(
             "best_source_filename",
             "score",
             "rotation_error_deg",
+            "folded_halfturn_rotation_error_deg",
+            "halfturn_symmetry_gain_deg",
+            "mesh_symmetry_rotation_error_deg",
+            "mesh_symmetry_gain_deg",
             "translation_error",
             "pred_quaternion",
             "pred_translation",
