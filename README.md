@@ -191,3 +191,32 @@ benchmark refiner workflow produces:
 - `metrics.json`
 - `retrievals.csv`
 - `qualitative_gallery.png`
+
+# Classification
+Training
+```bash
+python3 scripts/run_classification_train.py \
+  --dataset-root spe3r \
+  --classification-csv classification.csv \
+  --output-dir outputs/classification_sat_holdout_v6 \
+  --epochs 20 \
+  --split-mode satellite \
+  --learning-rate 2e-4 \
+  --weight-decay 3e-4 \
+  --label-smoothing 0.1 \
+  --class-weight-power 0.8 \
+  --use-class-weighted-loss \
+  --use-weighted-sampler \
+  --checkpoint-metric macro_acc \
+  --strong-augmentation \
+  --early-stopping-patience 6
+```
+Eval
+```bash
+python3 scripts/run_classification_eval.py \
+  --dataset-root spe3r \
+  --classification-csv classification.csv \
+  --checkpoint outputs/classification_sat_holdout_v5/best_model.pt \
+  --split-mode satellite \
+  --output-dir outputs/classification_sat_holdout_v6_eval
+```
