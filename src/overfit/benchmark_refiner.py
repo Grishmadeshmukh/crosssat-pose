@@ -35,6 +35,9 @@ from models import MeshPoseScoringModel
 from overfit.geometry_search import MeshRenderer, make_observation, mask_contour, rank_candidates
 
 
+BENCHMARK_INPUT_CHANNELS = 12
+
+
 @dataclass
 class RefinedCandidate:
     quaternion_xyzw: np.ndarray
@@ -70,33 +73,73 @@ def _resize_single_channel(array: np.ndarray, image_size: int) -> np.ndarray:
     return np.asarray(resized, dtype=np.float32)
 
 
+def _normalize_masked_depth(depth: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    normalized = np.zeros_like(depth, dtype=np.float32)
+    if not np.any(mask):
+        return normalized
+    valid = depth[mask]
+    depth_min = float(valid.min())
+    depth_max = float(valid.max())
+    scale = max(depth_max - depth_min, 1e-6)
+    normalized[mask] = (depth[mask] - depth_min) / scale
+    return normalized
+
+
+def _depth_edge_channel(depth: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    if not np.any(mask):
+        return np.zeros_like(depth, dtype=np.float32)
+    grad_y, grad_x = np.gradient(depth.astype(np.float32))
+    magnitude = np.hypot(grad_x, grad_y)
+    magnitude = magnitude * mask.astype(np.float32)
+    if not np.any(mask):
+        return magnitude
+    valid = magnitude[mask]
+    scale = float(np.quantile(valid, 0.95))
+    if scale <= 1e-6:
+        return np.zeros_like(magnitude, dtype=np.float32)
+    return np.clip(magnitude / scale, 0.0, 1.0).astype(np.float32)
+
+
 def build_cropped_pair_tensor(
     query_rgb: np.ndarray,
     query_mask: np.ndarray,
     render_rgb_u8: np.ndarray,
     render_mask: np.ndarray,
+    render_depth: np.ndarray,
     *,
     image_size: int,
     crop_padding: int,
 ) -> torch.Tensor:
     render_rgb = render_rgb_u8.astype(np.float32) / 255.0
     render_mask = render_mask.astype(bool)
+    query_mask = query_mask.astype(bool)
+    query_rgb = query_rgb * query_mask[..., None].astype(np.float32)
+    render_rgb = render_rgb * render_mask[..., None].astype(np.float32)
+    query_contour = mask_contour(query_mask).astype(np.float32)
     render_contour = mask_contour(render_mask).astype(np.float32)
+    render_depth_norm = _normalize_masked_depth(render_depth.astype(np.float32), render_mask)
+    render_depth_edges = _depth_edge_channel(render_depth_norm, render_mask)
     y0, y1, x0, x1 = crop_box_from_masks(query_mask, render_mask, padding=crop_padding)
 
     query_rgb_crop = _resize_rgb(query_rgb[y0:y1, x0:x1], image_size)
     query_mask_crop = _resize_single_channel(query_mask[y0:y1, x0:x1].astype(np.float32), image_size)[..., None]
+    query_contour_crop = _resize_single_channel(query_contour[y0:y1, x0:x1], image_size)[..., None]
     render_rgb_crop = _resize_rgb(render_rgb[y0:y1, x0:x1], image_size)
     render_mask_crop = _resize_single_channel(render_mask[y0:y1, x0:x1].astype(np.float32), image_size)[..., None]
     render_contour_crop = _resize_single_channel(render_contour[y0:y1, x0:x1], image_size)[..., None]
+    render_depth_crop = _resize_single_channel(render_depth_norm[y0:y1, x0:x1], image_size)[..., None]
+    render_depth_edge_crop = _resize_single_channel(render_depth_edges[y0:y1, x0:x1], image_size)[..., None]
 
     stacked = np.concatenate(
         [
             query_rgb_crop,
             query_mask_crop,
+            query_contour_crop,
             render_rgb_crop,
             render_mask_crop,
             render_contour_crop,
+            render_depth_crop,
+            render_depth_edge_crop,
         ],
         axis=-1,
     )
@@ -474,13 +517,14 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
                         "rendering first shortlist candidate "
                         f"source={candidate.filename}"
                     )
-                render_rgb_u8, render_mask = renderer.render(candidate.quaternion_xyzw, candidate.translation)
+                render_rgb_u8, render_mask, render_depth = renderer.render_with_depth(candidate.quaternion_xyzw, candidate.translation)
                 pair_tensors.append(
                     build_cropped_pair_tensor(
                         query_rgb,
                         query_mask,
                         render_rgb_u8,
                         render_mask,
+                        render_depth,
                         image_size=self.image_size,
                         crop_padding=self.crop_padding,
                     )
@@ -916,7 +960,7 @@ def train_benchmark_refiner(
     )
 
     model = MeshPoseScoringModel(
-        input_channels=9,
+        input_channels=BENCHMARK_INPUT_CHANNELS,
         base_width=base_width,
         hidden_dim=hidden_dim,
         predict_refinement=True,
@@ -1013,7 +1057,7 @@ def train_benchmark_refiner(
                     "grid_roll_bins": grid_roll_bins,
                     "grid_radius_samples": grid_radius_samples,
                 },
-                "input_channels": 9,
+                "input_channels": BENCHMARK_INPUT_CHANNELS,
                 "base_width": base_width,
                 "hidden_dim": hidden_dim,
                 "predict_refinement": True,
@@ -1100,13 +1144,14 @@ def run_shortlist_refinement(
         pair_tensors = []
         seed_quaternions = []
         for candidate in current:
-            render_rgb_u8, render_mask = renderer.render(candidate.quaternion_xyzw, candidate.translation)
+            render_rgb_u8, render_mask, render_depth = renderer.render_with_depth(candidate.quaternion_xyzw, candidate.translation)
             pair_tensors.append(
                 build_cropped_pair_tensor(
                     query_rgb,
                     query_mask,
                     render_rgb_u8,
                     render_mask,
+                    render_depth,
                     image_size=image_size,
                     crop_padding=crop_padding,
                 )
@@ -1123,7 +1168,7 @@ def run_shortlist_refinement(
 
         refined = []
         for candidate, quaternion_xyzw, score in zip(current, refined_quaternion, score_values):
-            render_rgb_u8, render_mask = renderer.render(quaternion_xyzw, candidate.translation)
+            render_rgb_u8, render_mask, _render_depth = renderer.render_with_depth(quaternion_xyzw, candidate.translation)
             refined.append(
                 RefinedCandidate(
                     quaternion_xyzw=np.asarray(quaternion_xyzw, dtype=np.float64),
@@ -1231,7 +1276,7 @@ def evaluate_benchmark_refiner(
 ) -> None:
     checkpoint_payload = load_torch_checkpoint(checkpoint, map_location="cpu")
     model = MeshPoseScoringModel(
-        input_channels=int(checkpoint_payload.get("input_channels", 9)),
+        input_channels=int(checkpoint_payload.get("input_channels", BENCHMARK_INPUT_CHANNELS)),
         base_width=int(checkpoint_payload.get("base_width", 32)),
         hidden_dim=int(checkpoint_payload.get("hidden_dim", 256)),
         predict_refinement=bool(checkpoint_payload.get("predict_refinement", True)),

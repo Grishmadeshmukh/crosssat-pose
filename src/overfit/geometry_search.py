@@ -138,13 +138,18 @@ class MeshRenderer:
         self.renderer = pyrender.OffscreenRenderer(viewport_width=int(camera_config["Nu"]), viewport_height=int(camera_config["Nv"]))
         self._closed = False
 
-    def render(self, quaternion_xyzw: np.ndarray, translation: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def render_with_depth(self, quaternion_xyzw: np.ndarray, translation: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         transform = self.cv_to_gl @ pose_matrix(quaternion_xyzw, translation)
         self.scene.set_pose(self.mesh_node, pose=transform)
         self.scene.set_pose(self.camera_node, pose=np.eye(4))
         self.scene.set_pose(self.light_node, pose=np.eye(4))
         color, depth = self.renderer.render(self.scene, flags=pyrender.RenderFlags.RGBA)
-        return color[:, :, :3], depth > 0
+        mask = depth > 0
+        return color[:, :, :3], mask, depth
+
+    def render(self, quaternion_xyzw: np.ndarray, translation: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        color, mask, _depth = self.render_with_depth(quaternion_xyzw, translation)
+        return color, mask
 
     def close(self) -> None:
         if self._closed:
