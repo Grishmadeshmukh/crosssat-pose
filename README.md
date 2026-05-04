@@ -220,27 +220,36 @@ python3 scripts/run_classification_eval.py \
   --split-mode satellite \
   --output-dir outputs/classification_sat_holdout_v6_eval
 ```
-1. Run classifier on an image
+
+Predict the architecture class for one image:
 ```bash
 python3 scripts/run_classification_predict.py \
   --checkpoint outputs/classification_sat_holdout_v6/best_model.pt \
-  --image /absolute/path/to/query_image.jpg \
-  --top-k 1
+  --image path/to/query.png
 ```
 
-2. Get all satellites in that predicted class
-Suppose prediction is: Box Bus + Solar Wings
-Then list satellites from classification.csv with this command:
+## Class-Conditioned Pose Routing
+
+This script connects the classifier to the benchmark pose estimator:
+- classifier predicts the satellite architecture class
+- a hardcoded representative route is selected for that class
+- the corresponding benchmark checkpoint is used to estimate pose for the query image
+
+For now, the representative routes are hardcoded in [run_class_conditioned_pose.py](/Users/dawn/Documents/nyu/courses/cvse/crosssat-pose/scripts/run_class_conditioned_pose.py) because we do not yet have trained pose models for every class.
+
 ```bash
-python3 - <<'PY'
-import csv
-target_class = "Box Bus + Solar Wings"  # replace with predicted class string
-with open("classification.csv", newline="") as f:
-    rows = list(csv.DictReader(f))
-matches = [r["satellite_name"] for r in rows if r["architecture_label"].strip() == target_class]
-print(f"class: {target_class}")
-print(f"count: {len(matches)}")
-for name in matches:
-    print(name)
-PY
+python3 scripts/run_class_conditioned_pose.py \
+  --classification-checkpoint outputs/classification_sat_holdout_v6/best_model.pt \
+  --query-image path/to/query.png \
+  --query-mask path/to/query_mask.png \
+  --max-candidate-samples 64 \
+  --no-use-structured-bank
 ```
+
+This writes:
+- `outputs/class_conditioned_pose/class_conditioned_result.json`
+- `outputs/class_conditioned_pose/summary.md`
+- `outputs/class_conditioned_pose/pose_prediction/prediction.json`
+- `outputs/class_conditioned_pose/pose_prediction/refined_render.png`
+- `outputs/class_conditioned_pose/pose_prediction/refined_mask.png`
+- `outputs/class_conditioned_pose/pose_prediction/overlay.png`

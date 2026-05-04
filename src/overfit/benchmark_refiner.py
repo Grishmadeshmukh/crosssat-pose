@@ -1245,6 +1245,140 @@ def _build_markdown_summary(metrics: dict[str, float], *, query_satellite: str, 
     )
 
 
+def predict_pose_for_image(
+    dataset_root: str | Path,
+    *,
+    checkpoint: str | Path,
+    mesh_satellite: str,
+    candidate_satellite: str | None,
+    query_image_path: str | Path,
+    query_mask_path: str | Path,
+    candidate_split: str,
+    max_candidate_samples: int,
+    candidate_strategy: str,
+    use_dataset_bank: bool,
+    use_structured_bank: bool,
+    grid_azimuth_bins: int,
+    grid_elevation_bins: int,
+    grid_roll_bins: int,
+    grid_radius_samples: int,
+    coarse_shortlist_size: int,
+    keep_top_k: int,
+    iterations: int,
+    device: str,
+    output_dir: str | Path | None,
+    seed: int,
+) -> dict[str, object]:
+    checkpoint_payload = load_torch_checkpoint(checkpoint, map_location="cpu")
+    model = MeshPoseScoringModel(
+        input_channels=int(checkpoint_payload.get("input_channels", BENCHMARK_INPUT_CHANNELS)),
+        base_width=int(checkpoint_payload.get("base_width", 32)),
+        hidden_dim=int(checkpoint_payload.get("hidden_dim", 256)),
+        predict_refinement=bool(checkpoint_payload.get("predict_refinement", True)),
+        rotation_only_refinement=bool(checkpoint_payload.get("rotation_only_refinement", True)),
+        translation_refinement_scale=float(checkpoint_payload.get("translation_refinement_scale", 0.0)),
+    )
+    model.load_state_dict(checkpoint_payload["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    candidate_satellite_name = candidate_satellite or mesh_satellite
+    candidate_ds = SPE3RSatellite(dataset_root, candidate_satellite_name)
+    mesh_ds = SPE3RSatellite(dataset_root, mesh_satellite)
+    camera_config = load_camera_config(dataset_root)
+    base_candidates = subsample_records(
+        candidate_ds.select_records(candidate_split),
+        max_candidate_samples,
+        strategy=candidate_strategy,
+        seed=seed,
+    )
+    coarse_candidates = build_coarse_candidate_bank(
+        base_candidates,
+        use_dataset_bank=use_dataset_bank,
+        use_structured_bank=use_structured_bank,
+        grid_azimuth_bins=grid_azimuth_bins,
+        grid_elevation_bins=grid_elevation_bins,
+        grid_roll_bins=grid_roll_bins,
+        grid_radius_samples=grid_radius_samples,
+    )
+
+    query_image = Image.open(query_image_path).convert("RGB")
+    query_mask_image = Image.open(query_mask_path).convert("L")
+    query_mask = np.asarray(query_mask_image, dtype=np.uint8) > 127
+    renderer = MeshRenderer(mesh_ds.model_path, camera_config)
+
+    try:
+        coarse_shortlist = build_coarse_shortlist_from_geometry(
+            renderer,
+            query_image,
+            query_mask_image,
+            coarse_candidates,
+            shortlist_size=coarse_shortlist_size,
+            crop_padding=int(checkpoint_payload.get("crop_padding", checkpoint_payload.get("config", {}).get("crop_padding", 12))),
+        )
+        refined = run_shortlist_refinement(
+            model,
+            renderer,
+            query_image,
+            query_mask,
+            coarse_shortlist,
+            image_size=int(checkpoint_payload.get("config", {}).get("image_size", 224)),
+            crop_padding=int(checkpoint_payload.get("crop_padding", checkpoint_payload.get("config", {}).get("crop_padding", 12))),
+            device=device,
+            iterations=iterations,
+            keep_top_k=keep_top_k,
+        )
+    finally:
+        renderer.close()
+
+    best = refined[0]
+    result = {
+        "checkpoint": str(checkpoint),
+        "mesh_satellite": mesh_satellite,
+        "candidate_satellite": candidate_satellite_name,
+        "query_image": str(query_image_path),
+        "query_mask": str(query_mask_path),
+        "num_candidates": len(coarse_candidates),
+        "coarse_shortlist_size": coarse_shortlist_size,
+        "iterations": iterations,
+        "score": float(best.score),
+        "best_source_filename": best.source_filename or "",
+        "pred_quaternion_xyzw": [float(value) for value in best.quaternion_xyzw.tolist()],
+        "pred_translation": [float(value) for value in best.translation.tolist()],
+    }
+
+    if output_dir is not None:
+        output_root = ensure_dir(output_dir)
+        query_rgb = np.asarray(query_image, dtype=np.float32) / 255.0
+        if best.render_rgb is not None:
+            Image.fromarray(np.clip(best.render_rgb * 255.0, 0.0, 255.0).astype(np.uint8)).save(output_root / "refined_render.png")
+        if best.render_mask is not None:
+            Image.fromarray((best.render_mask.astype(np.uint8) * 255)).save(output_root / "refined_mask.png")
+            overlay = _overlay_mask_on_image(query_rgb, best.render_mask)
+            Image.fromarray(np.clip(overlay * 255.0, 0.0, 255.0).astype(np.uint8)).save(output_root / "overlay.png")
+        write_json(output_root / "prediction.json", result)
+        write_text(
+            output_root / "summary.md",
+            "\n".join(
+                [
+                    "# Class-conditioned pose prediction",
+                    "",
+                    f"- Mesh satellite: `{mesh_satellite}`",
+                    f"- Candidate satellite: `{candidate_satellite_name}`",
+                    f"- Coarse candidate bank size: {len(coarse_candidates)}",
+                    f"- Coarse shortlist size: {coarse_shortlist_size}",
+                    f"- Refinement iterations: {iterations}",
+                    f"- Final score: {best.score:.4f}",
+                    f"- Best source filename: `{best.source_filename or ''}`",
+                    f"- Predicted quaternion (xyzw): `{' '.join(f'{value:.6f}' for value in best.quaternion_xyzw.tolist())}`",
+                    f"- Predicted translation: `{' '.join(f'{value:.6f}' for value in best.translation.tolist())}`",
+                ]
+            ),
+        )
+
+    return result
+
+
 def evaluate_benchmark_refiner(
     dataset_root: str | Path,
     *,
