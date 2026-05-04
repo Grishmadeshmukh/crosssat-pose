@@ -15,6 +15,7 @@ from _bootstrap import add_src_to_path, default_dataset_root, project_root
 add_src_to_path()
 
 from classification import build_validation_dataset
+from common import load_torch_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +43,7 @@ def build_model(num_classes: int) -> torch.nn.Module:
 
 def main() -> None:
     args = parse_args()
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = load_torch_checkpoint(args.checkpoint, map_location="cpu")
     class_names = checkpoint["class_names"]
     model = build_model(len(class_names))
     model.load_state_dict(checkpoint["model_state_dict"])

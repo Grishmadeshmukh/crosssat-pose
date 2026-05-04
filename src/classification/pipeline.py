@@ -14,7 +14,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import models, transforms
 
-from common import ensure_dir, set_seed
+from common import ensure_dir, load_torch_checkpoint, set_seed
 from data_utils import SPE3RSatellite
 
 
@@ -495,7 +495,7 @@ def predict_image(
     *,
     top_k: int = 3,
 ) -> list[tuple[str, float]]:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = load_torch_checkpoint(checkpoint_path, map_location="cpu")
     class_names = checkpoint["class_names"]
     image_size = int(checkpoint["image_size"])
     model = _build_model(len(class_names))

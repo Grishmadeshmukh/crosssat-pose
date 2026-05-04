@@ -16,7 +16,7 @@ from PIL import Image
 from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader, Dataset, get_worker_info
 
-from common import ensure_dir, write_csv, write_json, write_text
+from common import ensure_dir, load_torch_checkpoint, write_csv, write_json, write_text
 from data_utils import PoseRecord, SPE3RSatellite, load_camera_config, subsample_records
 from geometry_utils import (
     camera_positions_in_body_frame,
@@ -1229,7 +1229,7 @@ def evaluate_benchmark_refiner(
     output_dir: str | Path,
     seed: int,
 ) -> None:
-    checkpoint_payload = torch.load(checkpoint, map_location="cpu")
+    checkpoint_payload = load_torch_checkpoint(checkpoint, map_location="cpu")
     model = MeshPoseScoringModel(
         input_channels=int(checkpoint_payload.get("input_channels", 9)),
         base_width=int(checkpoint_payload.get("base_width", 32)),

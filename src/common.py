@@ -38,6 +38,15 @@ def write_json(path: str | Path, payload: object) -> None:
     destination.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
 
 
+def load_torch_checkpoint(path: str | Path, *, map_location: str = "cpu") -> object:
+    if torch is None:  # pragma: no cover
+        raise RuntimeError("PyTorch is required to load checkpoints.")
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def write_text(path: str | Path, text: str) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
