@@ -20,10 +20,22 @@ def ensure_dir(path: str | Path) -> Path:
     return directory
 
 
+def _json_default(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if torch is not None and isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 def write_json(path: str | Path, payload: object) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    destination.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
 
 
 def write_text(path: str | Path, text: str) -> None:
