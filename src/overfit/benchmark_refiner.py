@@ -557,8 +557,14 @@ class ShortlistRefinerDataset(Dataset[dict[str, object]]):
             raise
 
     def __del__(self) -> None:  # pragma: no cover
+        self.close()
+
+    def close(self) -> None:
         if self._renderer is not None:
-            self._renderer.close()
+            try:
+                self._renderer.close()
+            except Exception as exc:  # pragma: no cover
+                self._dataset_log(f"renderer close warning: {type(exc).__name__}: {exc}")
             self._renderer = None
 
 
@@ -1040,6 +1046,8 @@ def train_benchmark_refiner(
             "config": best_state["config"],
         },
     )
+    train_dataset.close()
+    eval_dataset.close()
     _log(f"finished best_epoch={best_epoch} best_eval_loss={best_eval_loss:.4f}")
 
 

@@ -136,6 +136,7 @@ class MeshRenderer:
         self.light_node = self.scene.add(pyrender.DirectionalLight(color=np.ones(3), intensity=2.5), pose=np.eye(4))
         self.cv_to_gl = np.diag([1.0, -1.0, -1.0, 1.0])
         self.renderer = pyrender.OffscreenRenderer(viewport_width=int(camera_config["Nu"]), viewport_height=int(camera_config["Nv"]))
+        self._closed = False
 
     def render(self, quaternion_xyzw: np.ndarray, translation: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         transform = self.cv_to_gl @ pose_matrix(quaternion_xyzw, translation)
@@ -146,7 +147,13 @@ class MeshRenderer:
         return color[:, :, :3], depth > 0
 
     def close(self) -> None:
-        self.renderer.delete()
+        if self._closed:
+            return
+        try:
+            self.renderer.delete()
+        except Exception:
+            pass
+        self._closed = True
 
 
 def score_pose(renderer: MeshRenderer, observation: Observation, quaternion_xyzw: np.ndarray, translation: np.ndarray, *, source_filename: str | None, crop_padding: int, store_render: bool = False) -> ScoredPose:
@@ -351,4 +358,3 @@ def run_geometry_experiment(
         ),
     )
     save_gallery(gallery, output_root / "qualitative_gallery.png")
-
